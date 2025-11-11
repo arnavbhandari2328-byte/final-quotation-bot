@@ -1,7 +1,5 @@
-flask
-python-dotenv
-google-generativeai
-yagmail
-gunicorn
-requests
-python-docx==0.8.11
+﻿Flask==3.0.0
+python-docx==1.1.2
+yagmail==0.15.293
+requests==2.32.3
+gunicorn==23.0.0
