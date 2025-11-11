@@ -2,6 +2,7 @@
 from datetime import datetime
 from docx import Document
 import re, os, traceback, yagmail
+import threading
 
 app = Flask(__name__)
 
@@ -227,6 +228,21 @@ def send_email(attachment_path:str, to_email:str):
         app.logger.exception(f"Email send failed: {e}")
         return False
 
+
+def _background_worker(text: str):
+    """Background worker: parse, create doc, send email. Runs in a daemon thread."""
+    try:
+        app.logger.info(f"[BG] start processing: {text}")
+        ctx = parse_message(text)
+        if not ctx:
+            app.logger.warning("[BG] parse failed; skipping")
+            return
+        file_path = create_doc(ctx)
+        ok = send_email(file_path, ctx.get("email"))
+        app.logger.info(f"[BG] done: emailed={ok} file={file_path}")
+    except Exception as e:
+        app.logger.exception(f"Exception in background worker: {e}")
+
 def extract_text_from_meta(payload:dict) -> str | None:
     try:
         entry = payload.get("entry", [])[0]
@@ -264,15 +280,16 @@ def webhook():
             app.logger.info("Webhook received but no parsable text message; returning 200.")
             return jsonify({"status": "ignored"}), 200
 
-        app.logger.info(f"Received message: {text}")
-        ctx = parse_message(text)
-        if not ctx:
-            app.logger.warning("Regex parsing failed; returning success 200 to avoid WA retry.")
-            return jsonify({"status": "parsed:false"}), 200
+        # Immediately acknowledge to WhatsApp / Meta to avoid retries
+        try:
+            thread = threading.Thread(target=_background_worker, args=(text,), daemon=True)
+            thread.start()
+            app.logger.info("[WEBHOOK] background worker started")
+        except Exception as e:
+            app.logger.exception(f"Failed to start background worker: {e}")
 
-        file_path = create_doc(ctx)
-        ok = send_email(file_path, ctx["email"])
-        return jsonify({"status": "ok", "emailed": bool(ok), "file": file_path}), 200
+    # Return 200 "ok" immediately to acknowledge WhatsApp/Meta and avoid retries
+    return Response("ok", status=200)
 
     except Exception as e:
         app.logger.error("Exception in /webhook: %s\n%s", e, traceback.format_exc())
