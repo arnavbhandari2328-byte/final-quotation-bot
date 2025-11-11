@@ -34,94 +34,164 @@ def _clean(s: str) -> str:
 def parse_message(text: str):
     if not text:
         return None
+
     raw = text
-    text = " ".join(text.split())  # squash whitespace
+    text = " ".join(text.split())
     app.logger.info(f"[PARSE] incoming: {raw}")
 
     import re
+
+    # ---------- helpers & regex ----------
     EMAIL_RE = re.compile(r'([\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,})')
     QNO_RE   = re.compile(r'\bquote\s*(\d{1,10})\b', re.I)
     RATE_RE  = re.compile(r'\b(?:rate|at)\s*([0-9]{3,})\b', re.I)
-    QTY_RE   = re.compile(r'\b(\d{1,7})\s*(pcs|nos|pieces?|kgs?|kg|mt|ton|bundle|bndl)?\b', re.I)
+    # allow "5pcs", "5 psc", "5psc", "5 nos" etc
+    QTY_RE   = re.compile(r'\b(\d{1,7})\s*(pcs|psc|nos|pieces?|kgs?|kg|mt|ton|bundle|bndl)?\b', re.I)
     HSN_RE   = re.compile(r'\bhsn\s*([0-9]{4,8})\b', re.I)
 
-    # Try a few structured patterns first (different word orders)
+    units_map = {
+        "piece":"pcs","pieces":"pcs","nos":"pcs","pcs":"pcs","psc":"pcs",
+        "kg":"Kgs","kgs":"Kgs","mt":"MT","ton":"Ton","bundle":"Bundle","bndl":"Bundle"
+    }
+
+    # Name patterns: "for NAME", "to NAME", "customer name is NAME"
+    NAME_PATTERNS = [
+        re.compile(r'\bfor\s+([A-Za-z][\w .\'\-]{1,60})\b', re.I),
+        re.compile(r'\bto\s+([A-Za-z][\w .\'\-]{1,60})\b', re.I),
+        re.compile(r'\bcustomer\s+name\s+is\s+([A-Za-z][\w .\'\-]{1,60})\b', re.I),
+    ]
+
+    # Company optional: "at COMPANY" if it exists
+    COMPANY_RE = re.compile(r'\bat\s+([^,]+)', re.I)
+
+    # ---------- try structured patterns first ----------
     patterns = [
         re.compile(
-            r"""quote\s*(?P<qno>\d+).*?\bfor\b\s+(?P<name>[^,]+?)\s+\bat\b\s+(?P<company>[^,]+),
-                \s*(?P<qty>\d+)\s*(?P<units>pcs|nos|pieces?|kgs?|kg|mt|ton)?\s+
-                (?P<product>.+?)\s+\bat\s+(?P<rate>\d{3,})\b(?:.*?\bhsn\b\s*(?P<hsn>\d{4,8}))?
+            r"""quote\s*(?P<qno>\d+).*?\b(?:for|to)\b\s+(?P<name>[^,]+?)
+                (?:\s+\bat\b\s+(?P<company>[^,]+))?
+                .*?(?P<qty>\d{1,7})\s*(?P<units>pcs|psc|nos|pieces?|kgs?|kg|mt|ton|bundle|bndl)?
+                \s+(?P<product>.+?)\s+\b(?:rate|at)\b\s+(?P<rate>\d{3,})
+                (?:.*?\bhsn\b\s*(?P<hsn>\d{4,8}))?
                 .*?\bemail\b\s*(?P<email>[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,})
             """, re.I | re.X),
-        re.compile(
-            r"""quote\s*(?P<qno>\d+).*?\bfor\b\s+(?P<name>[^,]+?)\s+\bat\b\s+(?P<company>[^,]+),
-                .*?\bemail\b\s*(?P<email>[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}).*?
-                (?P<qty>\d+)\s*(?P<units>pcs|nos|pieces?|kgs?|kg|mt|ton)?\s+
-                (?P<product>.+?)\s+\bat\s+(?P<rate>\d{3,})
-            """, re.I | re.X),
     ]
+
+    def norm_units(u):
+        u = (u or "").lower()
+        return units_map.get(u, "pcs")
 
     for pat in patterns:
         m = pat.search(text)
         if m:
             d = {k: _clean(v) if isinstance(v, str) else v for k, v in m.groupdict().items()}
-            # normalise units
-            u = (d.get("units") or "").lower()
-            units_map = {"piece":"pcs","pieces":"pcs","nos":"pcs","pcs":"pcs","kg":"Kgs","kgs":"Kgs","mt":"MT","ton":"Ton"}
-            d["units"] = units_map.get(u, "pcs") if d.get("qty") else ""
             return {
                 "qno": d.get("qno",""),
-                "name": d.get("name","").title(),
+                "name": (d.get("name","") or "").title(),
                 "company": d.get("company",""),
                 "qty": d.get("qty",""),
-                "units": d.get("units") or "pcs",
-                "product": d.get("product","")[:120],
+                "units": norm_units(d.get("units")) if d.get("qty") else "",
+                "product": (d.get("product","") or "")[:120],
                 "rate": d.get("rate",""),
                 "hsn": d.get("hsn",""),
                 "email": d.get("email",""),
             }
 
-    # Heuristic fallback: pick fields independently
+    # ---------- heuristic fallback ----------
     qno    = (QNO_RE.search(text) or [None, ""])[1]
     email  = (EMAIL_RE.search(text) or [None, ""])[1]
     rate   = (RATE_RE.search(text) or [None, ""])[1]
-    qtym   = QTY_RE.search(text)
+
+    qtym   = None
+    # prefer the 'quantity/qty' segment if present; else any number+unit
+    qty_kw = re.search(r'\b(quantity|qty)\b\s*(\d{1,7}\s*(?:pcs|psc|nos|pieces?|kgs?|kg|mt|ton|bundle|bndl)?)', text, re.I)
+    if qty_kw:
+        qtym = QTY_RE.search(qty_kw.group(0))
+    if not qtym:
+        qtym = QTY_RE.search(text)
+
     qty    = qtym.group(1) if qtym else ""
-    uraw   = (qtym.group(2) if qtym and qtym.lastindex and qtym.lastindex >= 2 else "") or ""
-    units  = {"piece":"pcs","pieces":"pcs","nos":"pcs","pcs":"pcs","kg":"Kgs","kgs":"Kgs","mt":"MT","ton":"Ton"}.get(uraw.lower(), "pcs")
+    uraw   = qtym.group(2) if (qtym and qtym.lastindex and qtym.lastindex >= 2) else ""
+    units  = norm_units(uraw) if qty else ""
     hsn    = (HSN_RE.search(text) or [None, ""])[1]
 
-    # name: after "for", up to " at "
+    # name: try multiple patterns
     name = ""
-    m = re.search(r"\bfor\s+(.+?)\s+\bat\b", text, re.I)
-    if m: name = _clean(m.group(1))
-    # company: after " at ", up to comma
+    for np in NAME_PATTERNS:
+        mm = np.search(text)
+        if mm:
+            name = _clean(mm.group(1))
+            break
+
+    # company (optional)
     company = ""
-    m = re.search(r"\bat\s+([^,]+)", text, re.I)
-    if m: company = _clean(m.group(1))
-    # product: try between qty and rate
+    mc = COMPANY_RE.search(text)
+    if mc:
+        company = _clean(mc.group(1))
+
+    # product: take the segment between the name and the first of (quantity|qty|rate|hsn|email)
     product = ""
-    if qty and rate:
-        m = re.search(fr"{re.escape(qty)}\s*(?:{uraw}|pcs|nos|pieces?|kgs?|kg|mt|ton)?\s+(.+?)\s+\bat\s+{rate}\b", text, re.I)
-        if m: product = _clean(m.group(1))
+    anchors = []
+    for a in [" quantity ", " qty ", " rate ", " hsn ", " email "]:
+        p = text.lower().find(a)
+        if p != -1:
+            anchors.append(p)
+    cut_to = min(anchors) if anchors else -1
+
+    # starting point: after name, or after "to/for/customer name is"
+    start = -1
+    if name:
+        # find where that name appears and begin after its occurrence
+        for tag in [" for ", " to ", " customer name is "]:
+            pos = text.lower().find(tag)
+            if pos != -1:
+                pos2 = pos + len(tag)
+                # next substring begins with the name
+                name_pos = text.lower().find(name.lower(), pos2)
+                if name_pos != -1:
+                    start = name_pos + len(name)
+                    break
+    # fallback: take from beginning
+    if start == -1:
+        start = 0
+    if cut_to != -1 and cut_to > start:
+        candidate = text[start:cut_to]
+    else:
+        candidate = text[start:]
+
+    # strip commas and filler words
+    candidate = candidate.strip(" ,.-")
+    # if candidate begins with delimiters like 'customer name is', trim again
+    candidate = re.sub(r'^(customer name is|for|to)\b', '', candidate, flags=re.I).strip(" ,.-")
+
+    # remove any trailing 'at <rate>' part if present
+    if rate:
+        candidate = re.sub(fr'\b(?:rate|at)\s*{re.escape(rate)}\b.*$', '', candidate, flags=re.I).strip(" ,.-")
+
+    # If it still looks empty but we had a "quantity ...", try the text between the start of the line and "quantity"
+    if not candidate and qty_kw:
+        head = text[: text.lower().find(qty_kw.group(1).lower())]
+        candidate = head.strip(" ,.-")
+
+    product = candidate[:120]
 
     ctx = {
         "qno": qno,
-        "name": name.title(),
-        "company": company,
+        "name": name.title() if name else "",
+        "company": company,          # optional
         "qty": qty,
         "units": units if qty else "",
-        "product": product[:120],
+        "product": product,
         "rate": rate,
         "hsn": hsn,
         "email": email,
     }
 
-    # minimal validation
-    required = ["name","company","qty","rate","email"]
+    # Only require name, qty, rate, email; company is optional
+    required = ["name", "qty", "rate", "email"]
     if any(not ctx[k] for k in required):
         app.logger.warning(f"[PARSE] fallback incomplete -> {ctx}")
         return None
+
     return ctx
 
 def create_doc(ctx:dict) -> str:
