@@ -4,3 +4,4 @@ google-generativeai
 yagmail
 gunicorn
 requests
+python-docx==0.8.11
