@@ -5,6 +5,9 @@ import re, os, traceback, yagmail
 
 app = Flask(__name__)
 
+import logging
+app.logger.setLevel(logging.INFO)
+
 # ----- CONFIG -----
 GMAIL_USER = os.getenv("GMAIL_USER")
 GMAIL_PASS = os.getenv("GMAIL_PASS")
@@ -25,22 +28,101 @@ QUOTE_RE = re.compile(
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
 )
 
-def parse_message(text:str):
-    m = QUOTE_RE.search(text or "")
-    if not m:
+def _clean(s: str) -> str:
+    return " ".join((s or "").strip().split())
+
+def parse_message(text: str):
+    if not text:
         return None
-    d = m.groupdict()
-    # Normalise fields
-    d["qno"] = d["qno"].strip()
-    d["name"] = d["name"].strip().title()
-    d["company"] = d["company"].strip()
-    d["qty"] = d["qty"].strip()
-    d["units"] = (d.get("units") or "pcs").title()
-    d["product"] = " ".join((d.get("product") or "").split())[:120]
-    d["rate"] = d["rate"].strip()
-    d["hsn"] = (d.get("hsn") or "").strip()
-    d["email"] = d["email"].strip()
-    return d
+    raw = text
+    text = " ".join(text.split())  # squash whitespace
+    app.logger.info(f"[PARSE] incoming: {raw}")
+
+    import re
+    EMAIL_RE = re.compile(r'([\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,})')
+    QNO_RE   = re.compile(r'\bquote\s*(\d{1,10})\b', re.I)
+    RATE_RE  = re.compile(r'\b(?:rate|at)\s*([0-9]{3,})\b', re.I)
+    QTY_RE   = re.compile(r'\b(\d{1,7})\s*(pcs|nos|pieces?|kgs?|kg|mt|ton|bundle|bndl)?\b', re.I)
+    HSN_RE   = re.compile(r'\bhsn\s*([0-9]{4,8})\b', re.I)
+
+    # Try a few structured patterns first (different word orders)
+    patterns = [
+        re.compile(
+            r"""quote\s*(?P<qno>\d+).*?\bfor\b\s+(?P<name>[^,]+?)\s+\bat\b\s+(?P<company>[^,]+),
+                \s*(?P<qty>\d+)\s*(?P<units>pcs|nos|pieces?|kgs?|kg|mt|ton)?\s+
+                (?P<product>.+?)\s+\bat\s+(?P<rate>\d{3,})\b(?:.*?\bhsn\b\s*(?P<hsn>\d{4,8}))?
+                .*?\bemail\b\s*(?P<email>[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,})
+            """, re.I | re.X),
+        re.compile(
+            r"""quote\s*(?P<qno>\d+).*?\bfor\b\s+(?P<name>[^,]+?)\s+\bat\b\s+(?P<company>[^,]+),
+                .*?\bemail\b\s*(?P<email>[\w.\-+%]+@[\w.\-]+\.[A-Za-z]{2,}).*?
+                (?P<qty>\d+)\s*(?P<units>pcs|nos|pieces?|kgs?|kg|mt|ton)?\s+
+                (?P<product>.+?)\s+\bat\s+(?P<rate>\d{3,})
+            """, re.I | re.X),
+    ]
+
+    for pat in patterns:
+        m = pat.search(text)
+        if m:
+            d = {k: _clean(v) if isinstance(v, str) else v for k, v in m.groupdict().items()}
+            # normalise units
+            u = (d.get("units") or "").lower()
+            units_map = {"piece":"pcs","pieces":"pcs","nos":"pcs","pcs":"pcs","kg":"Kgs","kgs":"Kgs","mt":"MT","ton":"Ton"}
+            d["units"] = units_map.get(u, "pcs") if d.get("qty") else ""
+            return {
+                "qno": d.get("qno",""),
+                "name": d.get("name","").title(),
+                "company": d.get("company",""),
+                "qty": d.get("qty",""),
+                "units": d.get("units") or "pcs",
+                "product": d.get("product","")[:120],
+                "rate": d.get("rate",""),
+                "hsn": d.get("hsn",""),
+                "email": d.get("email",""),
+            }
+
+    # Heuristic fallback: pick fields independently
+    qno    = (QNO_RE.search(text) or [None, ""])[1]
+    email  = (EMAIL_RE.search(text) or [None, ""])[1]
+    rate   = (RATE_RE.search(text) or [None, ""])[1]
+    qtym   = QTY_RE.search(text)
+    qty    = qtym.group(1) if qtym else ""
+    uraw   = (qtym.group(2) if qtym and qtym.lastindex and qtym.lastindex >= 2 else "") or ""
+    units  = {"piece":"pcs","pieces":"pcs","nos":"pcs","pcs":"pcs","kg":"Kgs","kgs":"Kgs","mt":"MT","ton":"Ton"}.get(uraw.lower(), "pcs")
+    hsn    = (HSN_RE.search(text) or [None, ""])[1]
+
+    # name: after "for", up to " at "
+    name = ""
+    m = re.search(r"\bfor\s+(.+?)\s+\bat\b", text, re.I)
+    if m: name = _clean(m.group(1))
+    # company: after " at ", up to comma
+    company = ""
+    m = re.search(r"\bat\s+([^,]+)", text, re.I)
+    if m: company = _clean(m.group(1))
+    # product: try between qty and rate
+    product = ""
+    if qty and rate:
+        m = re.search(fr"{re.escape(qty)}\s*(?:{uraw}|pcs|nos|pieces?|kgs?|kg|mt|ton)?\s+(.+?)\s+\bat\s+{rate}\b", text, re.I)
+        if m: product = _clean(m.group(1))
+
+    ctx = {
+        "qno": qno,
+        "name": name.title(),
+        "company": company,
+        "qty": qty,
+        "units": units if qty else "",
+        "product": product[:120],
+        "rate": rate,
+        "hsn": hsn,
+        "email": email,
+    }
+
+    # minimal validation
+    required = ["name","company","qty","rate","email"]
+    if any(not ctx[k] for k in required):
+        app.logger.warning(f"[PARSE] fallback incomplete -> {ctx}")
+        return None
+    return ctx
 
 def create_doc(ctx:dict) -> str:
     doc = Document()
@@ -106,6 +188,7 @@ def webhook():
         # POST
         body = request.get_json(silent=True) or {}
         # Accept both tester JSON and Meta payload
+        app.logger.info(f"[WEBHOOK] body: {body}")
         text = body.get("message") or extract_text_from_meta(body)
         if not text:
             app.logger.info("Webhook received but no parsable text message; returning 200.")
