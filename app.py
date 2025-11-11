@@ -289,32 +289,35 @@ def webhook():
             return Response(challenge, status=200)
         return Response("Verification token mismatch", status=403)
 
-    # POST: WhatsApp update
+    # POST: WhatsApp update - extract text and reuse /quote logic
     data = request.get_json(silent=True) or {}
     try:
         change = data["entry"][0]["changes"][0]["value"]
-        if "messages" in change and change["messages"]:
-            msg = change["messages"][0]
-            if msg.get("type") == "text":
-                user_text = msg["text"]["body"]
-                print("Processing WhatsApp message:", user_text)
+        messages = change.get("messages") or []
+        if not messages:
+            # Nothing to process; acknowledge
+            return jsonify({"status": "ok"})
 
-                success, message = process_quotation_request(user_text)
-                if success:
-                    print(message)  # Log success message
-                    return jsonify({"status": "ok"})
-                else:
-                    print("Error:", message)  # Log error message
-                    # For webhook, return a generic invalid-format response per spec
-                    return jsonify({"status": "error", "message": "Invalid format"})
-            else:
-                print("Received non-text message type:", msg.get("type"))
-                return jsonify({"status": "error", "message": "Only text messages are supported"})
+        msg = messages[0]
+        # Only accept text messages
+        if msg.get("type") != "text":
+            return jsonify({"status": "error", "message": "Invalid format"})
+
+        user_text = msg["text"]["body"]
     except Exception as e:
         print("Webhook parse error:", e, data)
         return jsonify({"status": "error", "message": "Invalid format"})
 
-    return jsonify({"status": "ok"})
+    # Reuse the same processing used by /quote
+    success, message = process_quotation_request(user_text)
+    if success:
+        # process_quotation_request already logs the send; ensure the requested log format
+        # message typically contains the success string including email; still log explicitly
+        print(message)
+        return jsonify({"status": "ok"})
+    else:
+        print("Error during processing:", message)
+        return jsonify({"status": "error", "message": "Invalid format"})
 
 @app.route("/quote", methods=["POST"])
 def quote():
